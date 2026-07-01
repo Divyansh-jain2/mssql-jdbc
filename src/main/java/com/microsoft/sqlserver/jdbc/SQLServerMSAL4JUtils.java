@@ -82,6 +82,13 @@ class SQLServerMSAL4JUtils {
 
     private static final Semaphore sem = new Semaphore(1);
 
+    // Per-service-principal semaphore registry for the ActiveDirectoryServicePrincipal flow.
+    // Instead of the single global Semaphore(1) gating every credential, each distinct service
+    // principal -- keyed by the same hashedSecret used for TOKEN_CACHE_MAP -- gets its own
+    // Semaphore(1). Concurrent callers for the SAME principal still serialise so the first
+    // populates the shared token cache, but unrelated principals never block one another.
+    private static final ConcurrentHashMap<String, Semaphore> PER_SP_SEM = new ConcurrentHashMap<>();
+
     static SqlAuthenticationToken getSqlFedAuthToken(SqlFedAuthInfo fedAuthInfo, String user, String password,
             String authenticationString, int millisecondsRemaining) throws SQLServerException {
         ExecutorService executorService = Executors.newSingleThreadExecutor();
@@ -167,21 +174,28 @@ class SQLServerMSAL4JUtils {
                                                                     : fedAuthInfo.spn + defaultScopeSuffix;
         Set<String> scopes = new HashSet<>();
         scopes.add(scope);
-        
+
         boolean isSemAcquired = false;
+        Semaphore spSem = null;
         try {
+            // The hashedSecret identifies this exact credential; it keys both the per-service-principal
+            // semaphore and the TOKEN_CACHE_MAP entry, so the gate partition matches the cache partition.
+            String hashedSecret = getHashedSecret(
+                    new String[] {fedAuthInfo.stsurl, aadPrincipalID, aadPrincipalSecret});
+
             //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
+            //Just try to acquire the per-service-principal semaphore and if can't then proceed to attempt to get the token.
             //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
             //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
             //then we want the others to also go and try after waiting for a while.
             //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
             //to get their tokens at the same time, stressing the auth endpoint.
+            //Unlike the global gate, this only serialises callers sharing the same service principal, so
+            //unrelated principals never block one another.
             //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            spSem = PER_SP_SEM.computeIfAbsent(hashedSecret, k -> new Semaphore(1));
+            isSemAcquired = spSem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
 
-            String hashedSecret = getHashedSecret(
-                    new String[] {fedAuthInfo.stsurl, aadPrincipalID, aadPrincipalSecret});
             PersistentTokenCacheAccessAspect persistentTokenCacheAccessAspect = TOKEN_CACHE_MAP.getEntry(aadPrincipalID,
                     hashedSecret);
 
@@ -226,7 +240,7 @@ class SQLServerMSAL4JUtils {
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), aadPrincipalID, authenticationString);
         } finally {
             if (isSemAcquired) {
-                sem.release();
+                spSem.release();
             }
             executorService.shutdown();
         }
