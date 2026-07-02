@@ -21,6 +21,7 @@ import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -81,6 +82,23 @@ class SQLServerMSAL4JUtils {
     }
 
     private static final Semaphore sem = new Semaphore(1);
+
+    // Single-flight (request coalescing) registry for the ActiveDirectoryServicePrincipal flow.
+    // The first caller for a given credential (keyed by the same hashedSecret used for
+    // TOKEN_CACHE_MAP) installs a shared future that performs the real AAD acquisition; concurrent
+    // callers for the SAME credential join that future instead of issuing their own request. This
+    // caps concurrent AAD calls at one per credential, and followers receive the leader's token
+    // rather than merely permission to retry. Entries are removed once the future completes so a
+    // later cold call re-leaders cleanly. Unrelated credentials never coordinate.
+    private static final ConcurrentHashMap<String, CompletableFuture<SqlAuthenticationToken>> INFLIGHT_TOKENS = new ConcurrentHashMap<>();
+
+    // Dedicated daemon thread pool that runs the leader futures, so a leader's AAD round-trip is
+    // not tied to any single caller's per-connection executor lifetime.
+    private static final ExecutorService COALESCE_EXEC = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "mssql-msal-coalesce");
+        t.setDaemon(true);
+        return t;
+    });
 
     static SqlAuthenticationToken getSqlFedAuthToken(SqlFedAuthInfo fedAuthInfo, String user, String password,
             String authenticationString, int millisecondsRemaining) throws SQLServerException {
@@ -165,22 +183,11 @@ class SQLServerMSAL4JUtils {
         String defaultScopeSuffix = SLASH_DEFAULT;
         String scope = fedAuthInfo.spn.endsWith(defaultScopeSuffix) ? fedAuthInfo.spn
                                                                     : fedAuthInfo.spn + defaultScopeSuffix;
-        Set<String> scopes = new HashSet<>();
+        final Set<String> scopes = new HashSet<>();
         scopes.add(scope);
-        
-        boolean isSemAcquired = false;
-        try {
-            //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
-            //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
-            //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
-            //then we want the others to also go and try after waiting for a while.
-            //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
-            //to get their tokens at the same time, stressing the auth endpoint.
-            //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
 
-            String hashedSecret = getHashedSecret(
+        try {
+            final String hashedSecret = getHashedSecret(
                     new String[] {fedAuthInfo.stsurl, aadPrincipalID, aadPrincipalSecret});
             PersistentTokenCacheAccessAspect persistentTokenCacheAccessAspect = TOKEN_CACHE_MAP.getEntry(aadPrincipalID,
                     hashedSecret);
@@ -199,35 +206,124 @@ class SQLServerMSAL4JUtils {
                 }
             }
 
-            IClientCredential credential = ClientCredentialFactory.createFromSecret(aadPrincipalSecret);
+            final IClientCredential credential = ClientCredentialFactory.createFromSecret(aadPrincipalSecret);
             ConfidentialClientApplication clientApplication = ConfidentialClientApplication
                     .builder(aadPrincipalID, credential).executorService(executorService)
                     .setTokenCacheAccessAspect(persistentTokenCacheAccessAspect).authority(fedAuthInfo.stsurl).build();
 
-            final CompletableFuture<IAuthenticationResult> future = clientApplication
-                    .acquireToken(ClientCredentialParameters.builder(scopes).build());
-            final IAuthenticationResult authenticationResult = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            //
+            // Fast path: try to satisfy the request from the MSAL in-memory token cache (rehydrated
+            // from the persistent cache aspect) WITHOUT coordinating with other threads. A cache hit
+            // needs no AAD round-trip, so it must never queue behind a coalesced acquisition.
+            //
+            try {
+                final IAuthenticationResult silentResult = clientApplication
+                        .acquireTokenSilently(SilentParameters.builder(scopes).build())
+                        .get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
 
-            if (logger.isLoggable(Level.FINER)) {
-                logger.finer(
-                        LOGCONTEXT + (authenticationResult.account() != null ? authenticationResult.account().username()
-                                + ": " : "" + ACCESS_TOKEN_EXPIRE + authenticationResult.expiresOnDate()));
+                if (logger.isLoggable(Level.FINER)) {
+                    logger.finer(LOGCONTEXT + ": retrieved token silently for principal id: " + aadPrincipalID);
+                }
+
+                return new SqlAuthenticationToken(silentResult.accessToken(), silentResult.expiresOnDate());
+            } catch (ExecutionException silentMiss) {
+                // No valid access token cached for these scopes; fall through to the coalesced slow path.
+                if (logger.isLoggable(Level.FINER)) {
+                    logger.finer(LOGCONTEXT + ": silent token acquisition missed for principal id: " + aadPrincipalID);
+                }
             }
 
-            return new SqlAuthenticationToken(authenticationResult.accessToken(), authenticationResult.expiresOnDate());
+            //
+            // Slow path: single-flight coalescing. The first caller for this credential installs a
+            // shared future that runs the real AAD acquisition on COALESCE_EXEC; concurrent callers
+            // for the same credential join that future instead of hitting AAD themselves.
+            //
+            final String inflightKey = hashedSecret;
+            final SqlFedAuthInfo fedAuthInfoRef = fedAuthInfo;
+            final String aadPrincipalIDRef = aadPrincipalID;
+            final boolean[] isLeader = {false};
+            final CompletableFuture<SqlAuthenticationToken> shared = INFLIGHT_TOKENS.computeIfAbsent(inflightKey,
+                    k -> {
+                        isLeader[0] = true;
+                        return CompletableFuture.supplyAsync(() -> {
+                            // The leader runs on COALESCE_EXEC with its own executor, so its AAD trip
+                            // is independent of any single caller's per-connection executor lifetime.
+                            ExecutorService leaderExecutor = Executors.newSingleThreadExecutor();
+                            try {
+                                PersistentTokenCacheAccessAspect leaderAspect = TOKEN_CACHE_MAP
+                                        .getEntry(aadPrincipalIDRef, k);
+                                if (null == leaderAspect) {
+                                    leaderAspect = new PersistentTokenCacheAccessAspect();
+                                    TOKEN_CACHE_MAP.addEntry(k, leaderAspect);
+                                }
+                                ConfidentialClientApplication leaderApp = ConfidentialClientApplication
+                                        .builder(aadPrincipalIDRef, credential).executorService(leaderExecutor)
+                                        .setTokenCacheAccessAspect(leaderAspect).authority(fedAuthInfoRef.stsurl)
+                                        .build();
+                                // One more silent attempt inside the leader: between the fast-path miss
+                                // and the leader waking up, another thread may have populated the cache.
+                                try {
+                                    IAuthenticationResult silentAgain = leaderApp
+                                            .acquireTokenSilently(SilentParameters.builder(scopes).build())
+                                            .get(TOKEN_WAIT_DURATION_MS, TimeUnit.MILLISECONDS);
+                                    return new SqlAuthenticationToken(silentAgain.accessToken(),
+                                            silentAgain.expiresOnDate());
+                                } catch (ExecutionException stillMiss) {
+                                    // genuine cache miss -- the leader must call AAD
+                                }
+                                IAuthenticationResult acquired = leaderApp
+                                        .acquireToken(ClientCredentialParameters.builder(scopes).build())
+                                        .get(TOKEN_WAIT_DURATION_MS, TimeUnit.MILLISECONDS);
+                                return new SqlAuthenticationToken(acquired.accessToken(), acquired.expiresOnDate());
+                            } catch (Exception e) {
+                                // Surface the cause to followers via ExecutionException.getCause().
+                                throw new CompletionException(e);
+                            } finally {
+                                leaderExecutor.shutdown();
+                            }
+                        }, COALESCE_EXEC);
+                    });
+
+            // The leader deregisters the entry when its future completes so the next cold call re-leaders.
+            if (isLeader[0]) {
+                shared.whenComplete((result, error) -> INFLIGHT_TOKENS.remove(inflightKey, shared));
+            }
+
+            // Every caller (leader or follower) waits on the shared future under its own deadline, so a
+            // slow leader never pins a follower past that follower's own login timeout.
+            try {
+                SqlAuthenticationToken token = shared.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS),
+                        TimeUnit.MILLISECONDS);
+                if (logger.isLoggable(Level.FINER)) {
+                    logger.finer(LOGCONTEXT + (isLeader[0] ? ": acquired token for principal id: "
+                            : ": joined in-flight token acquisition for principal id: ") + aadPrincipalID);
+                }
+                return token;
+            } catch (ExecutionException ee) {
+                Throwable cause = ee.getCause();
+                if (cause instanceof CompletionException && cause.getCause() != null) {
+                    cause = cause.getCause();
+                }
+                if (cause instanceof TimeoutException) {
+                    throw getCorrectedException(new SQLServerException(
+                            SQLServerException.getErrString("R_connectionTimedOut"), cause), aadPrincipalID,
+                            authenticationString);
+                }
+                if (cause instanceof Exception) {
+                    throw getCorrectedException((Exception) cause, aadPrincipalID, authenticationString);
+                }
+                throw new SQLServerException(null == cause ? ee.getMessage() : cause.getMessage(), cause);
+            }
         } catch (InterruptedException e) {
             // re-interrupt thread
             Thread.currentThread().interrupt();
 
             throw new SQLServerException(e.getMessage(), e);
-        } catch (MalformedURLException | ExecutionException e) {
+        } catch (MalformedURLException e) {
             throw getCorrectedException(e, aadPrincipalID, authenticationString);
         } catch (TimeoutException e) {
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), aadPrincipalID, authenticationString);
         } finally {
-            if (isSemAcquired) {
-                sem.release();
-            }
             executorService.shutdown();
         }
     }
