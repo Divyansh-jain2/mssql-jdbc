@@ -22,10 +22,11 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Lock;
@@ -67,7 +68,41 @@ class SQLServerMSAL4JUtils {
     static final String SLASH_DEFAULT = "/.default";
     static final String ACCESS_TOKEN_EXPIRE = "access token expires: ";
     static final long TOKEN_WAIT_DURATION_MS = 20000;
-    static final long TOKEN_SEM_WAIT_DURATION_MS = 5000;
+
+    // ===== .NET-inspired layered design (replaces Semaphore(1) + 5 s timer) =====
+    //
+    // Layer C: bound MSAL4J's DefaultHttpClient. MSAL4J defaults connectTimeout/readTimeout to 0
+    // (= infinite). MSAL.NET's HttpClient defaults to 100 s. Without these the only thing saving
+    // us from a hung AAD socket is the driver's own Future.get(20 s), which abandons the wait
+    // but does NOT cancel the underlying socket. Set explicit bounds here.
+    static final int MSAL_HTTP_CONNECT_TIMEOUT_MS = Integer.getInteger("mssql.msal.httpConnectTimeoutMs", 10_000);
+    static final int MSAL_HTTP_READ_TIMEOUT_MS = Integer.getInteger("mssql.msal.httpReadTimeoutMs", 30_000);
+
+    // Layer A: per-credential MSAL application cache. Mirrors MSAL.NET's s_pcaMap pattern so
+    // the long-lived application object survives across connections and its internal in-memory
+    // token cache (plus the Aspect's JSON cache) can serve subsequent hits cheaply.
+    private static final ConcurrentMap<String, ConfidentialClientApplication> CCA_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentMap<String, PublicClientApplication> PCA_CACHE = new ConcurrentHashMap<>();
+
+    // Layer B: per-key single-flight rendezvous. Replaces the JVM-wide Semaphore(1). Cold-burst
+    // followers wait on the leader's CompletableFuture; exactly 1 AAD call per credential per
+    // cold window. The .NET stack does not need this because MSAL.NET coalesces internally;
+    // MSAL4J does not document equivalent coalescing, so we provide it on the driver side.
+    private static final ConcurrentMap<String, CompletableFuture<SqlAuthenticationToken>> IN_FLIGHT = new ConcurrentHashMap<>();
+
+    // Shared daemon executor for cached MSAL applications. A per-call ExecutorService cannot be
+    // shutdown() after each call when the CCA/PCA is cached for reuse, so we share one process-
+    // wide daemon pool. Threads are daemons so they never block JVM shutdown.
+    private static final ThreadFactory MSAL_THREAD_FACTORY = new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "mssql-jdbc-msal");
+            t.setDaemon(true);
+            return t;
+        }
+    };
+    private static final ExecutorService SHARED_MSAL_EXECUTOR = Executors.newCachedThreadPool(MSAL_THREAD_FACTORY);
+
     private static final TokenCacheMap TOKEN_CACHE_MAP = new TokenCacheMap();
 
     private final static String LOGCONTEXT = "MSAL version "
@@ -80,83 +115,101 @@ class SQLServerMSAL4JUtils {
         throw new UnsupportedOperationException(SQLServerException.getErrString("R_notSupported"));
     }
 
-    private static final Semaphore sem = new Semaphore(1);
-
     static SqlAuthenticationToken getSqlFedAuthToken(SqlFedAuthInfo fedAuthInfo, String user, String password,
             String authenticationString, int millisecondsRemaining) throws SQLServerException {
-        ExecutorService executorService = Executors.newSingleThreadExecutor();
 
         if (logger.isLoggable(Level.FINEST)) {
             logger.finest(LOGCONTEXT + authenticationString + ": get FedAuth token for user: " + user);
         }
 
-        boolean isSemAcquired = false;
-        try {
-            //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
-            //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
-            //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
-            //then we want the others to also go and try after waiting for a while.
-            //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
-            //to get their tokens at the same time, stressing the auth endpoint.
-            //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
-
-            String hashedSecret = getHashedSecret(new String[] {fedAuthInfo.stsurl, user, password});
-            PersistentTokenCacheAccessAspect persistentTokenCacheAccessAspect = TOKEN_CACHE_MAP.getEntry(user,
-                    hashedSecret);
-
-            // check if account password was changed
-            if (null == persistentTokenCacheAccessAspect) {
-                persistentTokenCacheAccessAspect = new PersistentTokenCacheAccessAspect();
-                TOKEN_CACHE_MAP.addEntry(hashedSecret, persistentTokenCacheAccessAspect);
-
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + ": cache token for user: " + user);
-                }
-            } else {
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + ": retrieved cached token for user: " + user);
-                }
+        final String hashedSecret = getHashedSecret(new String[] {fedAuthInfo.stsurl, user, password});
+        PersistentTokenCacheAccessAspect aspect = TOKEN_CACHE_MAP.getEntry(user, hashedSecret);
+        if (null == aspect) {
+            aspect = new PersistentTokenCacheAccessAspect();
+            TOKEN_CACHE_MAP.addEntry(hashedSecret, aspect);
+            if (logger.isLoggable(Level.FINER)) {
+                logger.finer(LOGCONTEXT + ": cache token for user: " + user);
             }
+        } else if (logger.isLoggable(Level.FINER)) {
+            logger.finer(LOGCONTEXT + ": retrieved cached token for user: " + user);
+        }
 
-            final PublicClientApplication pca = PublicClientApplication
-                    .builder(ActiveDirectoryAuthentication.JDBC_FEDAUTH_CLIENT_ID).executorService(executorService)
-                    .setTokenCacheAccessAspect(persistentTokenCacheAccessAspect).authority(fedAuthInfo.stsurl).build();
+        // Layer A: get-or-build per-credential PCA (cached for reuse, HTTP timeouts applied).
+        final String cacheKey = "pwd:" + hashedSecret;
+        final PersistentTokenCacheAccessAspect aspectRef = aspect;
+        final PublicClientApplication pca;
+        try {
+            pca = PCA_CACHE.computeIfAbsent(cacheKey, k -> {
+                try {
+                    return PublicClientApplication
+                            .builder(ActiveDirectoryAuthentication.JDBC_FEDAUTH_CLIENT_ID)
+                            .executorService(SHARED_MSAL_EXECUTOR)
+                            .setTokenCacheAccessAspect(aspectRef)
+                            .authority(fedAuthInfo.stsurl)
+                            .connectTimeoutForDefaultHttpClient(MSAL_HTTP_CONNECT_TIMEOUT_MS)
+                            .readTimeoutForDefaultHttpClient(MSAL_HTTP_READ_TIMEOUT_MS)
+                            .build();
+                } catch (MalformedURLException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } catch (RuntimeException re) {
+            Throwable c = re.getCause();
+            if (c instanceof MalformedURLException) {
+                throw getCorrectedException((Exception) c, user, authenticationString);
+            }
+            throw re;
+        }
 
-            final CompletableFuture<IAuthenticationResult> future = pca.acquireToken(UserNamePasswordParameters
+        // Layer B: single-flight. Followers wait on the leader's future; only the leader hits AAD.
+        CompletableFuture<SqlAuthenticationToken> mine = new CompletableFuture<>();
+        CompletableFuture<SqlAuthenticationToken> winner = IN_FLIGHT.putIfAbsent(cacheKey, mine);
+        if (winner != null) {
+            try {
+                return winner.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new SQLServerException(e.getMessage(), e);
+            } catch (ExecutionException e) {
+                throw getCorrectedException(e, user, authenticationString);
+            } catch (TimeoutException e) {
+                throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), user, authenticationString);
+            }
+        }
+
+        // We are the leader: do the real AAD call exactly once for this cold-burst.
+        try {
+            CompletableFuture<IAuthenticationResult> future = pca.acquireToken(UserNamePasswordParameters
                     .builder(Collections.singleton(fedAuthInfo.spn + SLASH_DEFAULT), user, password.toCharArray())
                     .build());
-
-            final IAuthenticationResult authenticationResult = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
-
+            IAuthenticationResult ar = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
             if (logger.isLoggable(Level.FINER)) {
-                logger.finer(
-                        LOGCONTEXT + (authenticationResult.account() != null ? authenticationResult.account().username()
-                                + ": " : "" + ACCESS_TOKEN_EXPIRE + authenticationResult.expiresOnDate()));
+                logger.finer(LOGCONTEXT + (ar.account() != null ? ar.account().username() + ": "
+                        : "" + ACCESS_TOKEN_EXPIRE + ar.expiresOnDate()));
             }
-
-            return new SqlAuthenticationToken(authenticationResult.accessToken(), authenticationResult.expiresOnDate());
+            SqlAuthenticationToken tok = new SqlAuthenticationToken(ar.accessToken(), ar.expiresOnDate());
+            mine.complete(tok);
+            return tok;
         } catch (InterruptedException e) {
-            // re-interrupt thread
             Thread.currentThread().interrupt();
-
+            mine.completeExceptionally(e);
             throw new SQLServerException(e.getMessage(), e);
-        } catch (MalformedURLException | ExecutionException e) {
+        } catch (ExecutionException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(e, user, authenticationString);
         } catch (TimeoutException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), user, authenticationString);
+        } catch (RuntimeException e) {
+            mine.completeExceptionally(e);
+            throw e;
         } finally {
-            if (isSemAcquired) {
-                sem.release();
-            }
-            executorService.shutdown();
+            IN_FLIGHT.remove(cacheKey, mine);
         }
     }
 
     static SqlAuthenticationToken getSqlFedAuthTokenPrincipal(SqlFedAuthInfo fedAuthInfo, String aadPrincipalID,
             String aadPrincipalSecret, String authenticationString, int millisecondsRemaining) throws SQLServerException {
-        ExecutorService executorService = Executors.newSingleThreadExecutor();
 
         if (logger.isLoggable(Level.FINEST)) {
             logger.finest(LOGCONTEXT + authenticationString + ": get FedAuth token for principal: " + aadPrincipalID);
@@ -165,77 +218,107 @@ class SQLServerMSAL4JUtils {
         String defaultScopeSuffix = SLASH_DEFAULT;
         String scope = fedAuthInfo.spn.endsWith(defaultScopeSuffix) ? fedAuthInfo.spn
                                                                     : fedAuthInfo.spn + defaultScopeSuffix;
-        Set<String> scopes = new HashSet<>();
+        final Set<String> scopes = new HashSet<>();
         scopes.add(scope);
-        
-        boolean isSemAcquired = false;
-        try {
-            //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
-            //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
-            //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
-            //then we want the others to also go and try after waiting for a while.
-            //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
-            //to get their tokens at the same time, stressing the auth endpoint.
-            //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
 
-            String hashedSecret = getHashedSecret(
-                    new String[] {fedAuthInfo.stsurl, aadPrincipalID, aadPrincipalSecret});
-            PersistentTokenCacheAccessAspect persistentTokenCacheAccessAspect = TOKEN_CACHE_MAP.getEntry(aadPrincipalID,
-                    hashedSecret);
-
-            // check if principal secret was changed
-            if (null == persistentTokenCacheAccessAspect) {
-                persistentTokenCacheAccessAspect = new PersistentTokenCacheAccessAspect();
-                TOKEN_CACHE_MAP.addEntry(hashedSecret, persistentTokenCacheAccessAspect);
-
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + ": cache token for principal id: " + aadPrincipalID);
-                }
-            } else {
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + ": retrieved cached token for principal id: " + aadPrincipalID);
-                }
-            }
-
-            IClientCredential credential = ClientCredentialFactory.createFromSecret(aadPrincipalSecret);
-            ConfidentialClientApplication clientApplication = ConfidentialClientApplication
-                    .builder(aadPrincipalID, credential).executorService(executorService)
-                    .setTokenCacheAccessAspect(persistentTokenCacheAccessAspect).authority(fedAuthInfo.stsurl).build();
-
-            final CompletableFuture<IAuthenticationResult> future = clientApplication
-                    .acquireToken(ClientCredentialParameters.builder(scopes).build());
-            final IAuthenticationResult authenticationResult = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
-
+        final String hashedSecret = getHashedSecret(
+                new String[] {fedAuthInfo.stsurl, aadPrincipalID, aadPrincipalSecret});
+        PersistentTokenCacheAccessAspect aspect = TOKEN_CACHE_MAP.getEntry(aadPrincipalID, hashedSecret);
+        if (null == aspect) {
+            aspect = new PersistentTokenCacheAccessAspect();
+            TOKEN_CACHE_MAP.addEntry(hashedSecret, aspect);
             if (logger.isLoggable(Level.FINER)) {
-                logger.finer(
-                        LOGCONTEXT + (authenticationResult.account() != null ? authenticationResult.account().username()
-                                + ": " : "" + ACCESS_TOKEN_EXPIRE + authenticationResult.expiresOnDate()));
+                logger.finer(LOGCONTEXT + ": cache token for principal id: " + aadPrincipalID);
             }
+        } else if (logger.isLoggable(Level.FINER)) {
+            logger.finer(LOGCONTEXT + ": retrieved cached token for principal id: " + aadPrincipalID);
+        }
 
-            return new SqlAuthenticationToken(authenticationResult.accessToken(), authenticationResult.expiresOnDate());
+        // Layer A: get-or-build per-credential CCA, cached for reuse across connections.
+        final String cacheKey = "sp:" + hashedSecret;
+        final PersistentTokenCacheAccessAspect aspectRef = aspect;
+        final ConfidentialClientApplication cca;
+        try {
+            cca = CCA_CACHE.computeIfAbsent(cacheKey, k -> {
+                try {
+                    IClientCredential credential = ClientCredentialFactory.createFromSecret(aadPrincipalSecret);
+                    return buildSpCca(SHARED_MSAL_EXECUTOR, aadPrincipalID, credential, aspectRef,
+                            fedAuthInfo.stsurl);
+                } catch (MalformedURLException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } catch (RuntimeException re) {
+            Throwable c = re.getCause();
+            if (c instanceof MalformedURLException) {
+                throw getCorrectedException((Exception) c, aadPrincipalID, authenticationString);
+            }
+            throw re;
+        }
+
+        // Layer B: single-flight. Followers wait on the leader's future; only the leader hits AAD.
+        CompletableFuture<SqlAuthenticationToken> mine = new CompletableFuture<>();
+        CompletableFuture<SqlAuthenticationToken> winner = IN_FLIGHT.putIfAbsent(cacheKey, mine);
+        if (winner != null) {
+            // Follower path: wait on the leader's future instead of issuing a redundant AAD call.
+            try {
+                return winner.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new SQLServerException(e.getMessage(), e);
+            } catch (ExecutionException e) {
+                throw getCorrectedException(e, aadPrincipalID, authenticationString);
+            } catch (TimeoutException e) {
+                throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), aadPrincipalID, authenticationString);
+            }
+        }
+
+        // Leader path: real AAD call exactly once per cold-burst per credential.
+        try {
+            CompletableFuture<IAuthenticationResult> future = cca
+                    .acquireToken(ClientCredentialParameters.builder(scopes).build());
+            IAuthenticationResult ar = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            if (logger.isLoggable(Level.FINER)) {
+                logger.finer(LOGCONTEXT + (ar.account() != null ? ar.account().username() + ": "
+                        : "" + ACCESS_TOKEN_EXPIRE + ar.expiresOnDate()));
+            }
+            SqlAuthenticationToken tok = new SqlAuthenticationToken(ar.accessToken(), ar.expiresOnDate());
+            mine.complete(tok);
+            return tok;
         } catch (InterruptedException e) {
-            // re-interrupt thread
             Thread.currentThread().interrupt();
-
+            mine.completeExceptionally(e);
             throw new SQLServerException(e.getMessage(), e);
-        } catch (MalformedURLException | ExecutionException e) {
+        } catch (ExecutionException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(e, aadPrincipalID, authenticationString);
         } catch (TimeoutException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), aadPrincipalID, authenticationString);
+        } catch (RuntimeException e) {
+            mine.completeExceptionally(e);
+            throw e;
         } finally {
-            if (isSemAcquired) {
-                sem.release();
-            }
-            executorService.shutdown();
+            IN_FLIGHT.remove(cacheKey, mine);
         }
+    }
+
+    /**
+     * Builds a ConfidentialClientApplication for the SP (client_credentials) path with explicit
+     * HTTP connect/read timeouts so a hung AAD socket cannot outlive the driver's own deadline.
+     */
+    private static ConfidentialClientApplication buildSpCca(ExecutorService executorService, String clientId,
+            IClientCredential credential, PersistentTokenCacheAccessAspect aspect, String authority)
+            throws MalformedURLException {
+        return ConfidentialClientApplication.builder(clientId, credential).executorService(executorService)
+                .setTokenCacheAccessAspect(aspect).authority(authority)
+                .connectTimeoutForDefaultHttpClient(MSAL_HTTP_CONNECT_TIMEOUT_MS)
+                .readTimeoutForDefaultHttpClient(MSAL_HTTP_READ_TIMEOUT_MS).build();
     }
 
     static SqlAuthenticationToken getSqlFedAuthTokenPrincipalCertificate(SqlFedAuthInfo fedAuthInfo,
             String aadPrincipalID, String certFile, String certPassword, String certKey, String certKeyPassword,
             String authenticationString, int millisecondsRemaining) throws SQLServerException {
-        ExecutorService executorService = Executors.newSingleThreadExecutor();
 
         if (logger.isLoggable(Level.FINEST)) {
             logger.finest(LOGCONTEXT + authenticationString + ": get FedAuth token for principal certificate: "
@@ -245,187 +328,250 @@ class SQLServerMSAL4JUtils {
         String defaultScopeSuffix = SLASH_DEFAULT;
         String scope = fedAuthInfo.spn.endsWith(defaultScopeSuffix) ? fedAuthInfo.spn
                                                                     : fedAuthInfo.spn + defaultScopeSuffix;
-        Set<String> scopes = new HashSet<>();
+        final Set<String> scopes = new HashSet<>();
         scopes.add(scope);
 
-        boolean isSemAcquired = false;
-        try {
-            //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
-            //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
-            //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
-            //then we want the others to also go and try after waiting for a while.
-            //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
-            //to get their tokens at the same time, stressing the auth endpoint.
-            //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
-
-            String hashedSecret = getHashedSecret(new String[] {fedAuthInfo.stsurl, aadPrincipalID, certFile,
-                    certPassword, certKey, certKeyPassword});
-            PersistentTokenCacheAccessAspect persistentTokenCacheAccessAspect = TOKEN_CACHE_MAP.getEntry(aadPrincipalID,
-                    hashedSecret);
-
-            // check if cert was changed
-            if (null == persistentTokenCacheAccessAspect) {
-                persistentTokenCacheAccessAspect = new PersistentTokenCacheAccessAspect();
-                TOKEN_CACHE_MAP.addEntry(hashedSecret, persistentTokenCacheAccessAspect);
-
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + ": cache token for principal id: " + aadPrincipalID);
-                }
-            } else {
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + ": retrieved cached token for principal id: " + aadPrincipalID);
-                }
-            }
-
-            ConfidentialClientApplication clientApplication = null;
-
-            // check if cert is PKCS12 first
-            try (InputStream is = new FileInputStream(certFile)) {
-                KeyStore keyStore = SQLServerCertificateUtils.loadPKCS12KeyStore(certFile, certPassword);
-
-                if (logger.isLoggable(Level.FINEST)) {
-                    logger.finest(LOGCONTEXT + "certificate type: " + keyStore.getType());
-
-                    // we don't need to do this unless logging enabled since MSAL will fail if cert is not valid
-                    Enumeration<String> enumeration = keyStore.aliases();
-                    while (enumeration.hasMoreElements()) {
-                        String alias = enumeration.nextElement();
-                        X509Certificate cert = (X509Certificate) keyStore.getCertificate(alias);
-                        cert.checkValidity();
-                        logger.finest(LOGCONTEXT + "certificate: " + cert.toString());
-                    }
-                }
-
-                IClientCredential credential = ClientCredentialFactory.createFromCertificate(is, certPassword);
-                clientApplication = ConfidentialClientApplication.builder(aadPrincipalID, credential)
-                        .executorService(executorService).setTokenCacheAccessAspect(persistentTokenCacheAccessAspect)
-                        .authority(fedAuthInfo.stsurl).build();
-            } catch (FileNotFoundException e) {
-                // re-throw if file not there no point to try another format
-                throw new SQLServerException(SQLServerException.getErrString("R_readCertError") + e.getMessage(), null,
-                        0, null);
-            } catch (CertificateException | NoSuchAlgorithmException | IOException e) {
-                // ignore not PKCS12 cert error, will try another format after this
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + "Error loading PKCS12 certificate: " + e.getMessage());
-                }
-            }
-
-            if (clientApplication == null) {
-                // try loading X509 cert
-                X509Certificate cert = (X509Certificate) SQLServerCertificateUtils.loadCertificate(certFile);
-
-                if (logger.isLoggable(Level.FINER)) {
-                    logger.finer(LOGCONTEXT + "certificate type: " + cert.getType());
-
-                    // we don't really need to do this, MSAL will fail if cert is not valid, but good to check here and throw with proper error message
-                    cert.checkValidity();
-                    logger.finer(LOGCONTEXT + "certificate: " + cert.toString());
-                }
-
-                PrivateKey privateKey = SQLServerCertificateUtils.loadPrivateKey(certKey, certKeyPassword);
-
-                IClientCredential credential = ClientCredentialFactory.createFromCertificate(privateKey, cert);
-                clientApplication = ConfidentialClientApplication.builder(aadPrincipalID, credential)
-                        .executorService(executorService).setTokenCacheAccessAspect(persistentTokenCacheAccessAspect)
-                        .authority(fedAuthInfo.stsurl).build();
-            }
-
-            final CompletableFuture<IAuthenticationResult> future = clientApplication
-                    .acquireToken(ClientCredentialParameters.builder(scopes).build());
-            final IAuthenticationResult authenticationResult = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
-
+        final String hashedSecret = getHashedSecret(new String[] {fedAuthInfo.stsurl, aadPrincipalID, certFile,
+                certPassword, certKey, certKeyPassword});
+        PersistentTokenCacheAccessAspect aspect = TOKEN_CACHE_MAP.getEntry(aadPrincipalID, hashedSecret);
+        if (null == aspect) {
+            aspect = new PersistentTokenCacheAccessAspect();
+            TOKEN_CACHE_MAP.addEntry(hashedSecret, aspect);
             if (logger.isLoggable(Level.FINER)) {
-                logger.finer(
-                        LOGCONTEXT + (authenticationResult.account() != null ? authenticationResult.account().username()
-                                + ": " : "" + ACCESS_TOKEN_EXPIRE + authenticationResult.expiresOnDate()));
+                logger.finer(LOGCONTEXT + ": cache token for principal id: " + aadPrincipalID);
             }
+        } else if (logger.isLoggable(Level.FINER)) {
+            logger.finer(LOGCONTEXT + ": retrieved cached token for principal id: " + aadPrincipalID);
+        }
 
-            return new SqlAuthenticationToken(authenticationResult.accessToken(), authenticationResult.expiresOnDate());
+        // Layer A: get-or-build per-credential CCA (loads cert PKCS12-first, X509-fallback once).
+        final String cacheKey = "cert:" + hashedSecret;
+        final PersistentTokenCacheAccessAspect aspectRef = aspect;
+        final ConfidentialClientApplication cca;
+        try {
+            cca = CCA_CACHE.computeIfAbsent(cacheKey, k -> {
+                try {
+                    return buildCertCca(aadPrincipalID, certFile, certPassword, certKey, certKeyPassword,
+                            aspectRef, fedAuthInfo.stsurl);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } catch (RuntimeException re) {
+            Throwable c = re.getCause();
+            if (c instanceof FileNotFoundException) {
+                throw new SQLServerException(SQLServerException.getErrString("R_readCertError") + c.getMessage(), null,
+                        0, null);
+            }
+            if (c instanceof GeneralSecurityException) {
+                throw new SQLServerException(SQLServerException.getErrString("R_readCertError") + c.getMessage(), null,
+                        0, null);
+            }
+            if (c instanceof Exception) {
+                throw getCorrectedException((Exception) c, aadPrincipalID, authenticationString);
+            }
+            throw re;
+        }
+
+        // Layer B: single-flight
+        CompletableFuture<SqlAuthenticationToken> mine = new CompletableFuture<>();
+        CompletableFuture<SqlAuthenticationToken> winner = IN_FLIGHT.putIfAbsent(cacheKey, mine);
+        if (winner != null) {
+            try {
+                return winner.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new SQLServerException(e.getMessage(), e);
+            } catch (ExecutionException e) {
+                throw getCorrectedException(e, aadPrincipalID, authenticationString);
+            } catch (TimeoutException e) {
+                throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), aadPrincipalID, authenticationString);
+            }
+        }
+
+        try {
+            final CompletableFuture<IAuthenticationResult> future = cca
+                    .acquireToken(ClientCredentialParameters.builder(scopes).build());
+            final IAuthenticationResult ar = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            if (logger.isLoggable(Level.FINER)) {
+                logger.finer(LOGCONTEXT + (ar.account() != null ? ar.account().username() + ": "
+                        : "" + ACCESS_TOKEN_EXPIRE + ar.expiresOnDate()));
+            }
+            SqlAuthenticationToken tok = new SqlAuthenticationToken(ar.accessToken(), ar.expiresOnDate());
+            mine.complete(tok);
+            return tok;
         } catch (InterruptedException e) {
-            // re-interrupt thread
             Thread.currentThread().interrupt();
-
+            mine.completeExceptionally(e);
             throw new SQLServerException(e.getMessage(), e);
-        } catch (GeneralSecurityException e) {
-            // this includes all certificate exceptions
-            throw new SQLServerException(SQLServerException.getErrString("R_readCertError") + e.getMessage(), null, 0,
-                    null);
         } catch (TimeoutException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), aadPrincipalID, authenticationString);
         } catch (Exception e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(e, aadPrincipalID, authenticationString);
-
         } finally {
-            if (isSemAcquired) {
-                sem.release();
-            }
-            executorService.shutdown();
+            IN_FLIGHT.remove(cacheKey, mine);
         }
+    }
+
+    /**
+     * Loads the credential (PKCS12 first, then X509 fallback) and builds a ConfidentialClientApplication
+     * suitable for caching. Throws checked exceptions so the caller can map them to the right
+     * SQLServerException surface.
+     */
+    private static ConfidentialClientApplication buildCertCca(String aadPrincipalID, String certFile,
+            String certPassword, String certKey, String certKeyPassword, PersistentTokenCacheAccessAspect aspect,
+            String authority) throws GeneralSecurityException, IOException, SQLServerException {
+        ConfidentialClientApplication clientApplication = null;
+
+        // check if cert is PKCS12 first
+        try (InputStream is = new FileInputStream(certFile)) {
+            KeyStore keyStore = SQLServerCertificateUtils.loadPKCS12KeyStore(certFile, certPassword);
+
+            if (logger.isLoggable(Level.FINEST)) {
+                logger.finest(LOGCONTEXT + "certificate type: " + keyStore.getType());
+
+                // we don't need to do this unless logging enabled since MSAL will fail if cert is not valid
+                Enumeration<String> enumeration = keyStore.aliases();
+                while (enumeration.hasMoreElements()) {
+                    String alias = enumeration.nextElement();
+                    X509Certificate cert = (X509Certificate) keyStore.getCertificate(alias);
+                    cert.checkValidity();
+                    logger.finest(LOGCONTEXT + "certificate: " + cert.toString());
+                }
+            }
+
+            IClientCredential credential = ClientCredentialFactory.createFromCertificate(is, certPassword);
+            clientApplication = ConfidentialClientApplication.builder(aadPrincipalID, credential)
+                    .executorService(SHARED_MSAL_EXECUTOR).setTokenCacheAccessAspect(aspect)
+                    .authority(authority)
+                    .connectTimeoutForDefaultHttpClient(MSAL_HTTP_CONNECT_TIMEOUT_MS)
+                    .readTimeoutForDefaultHttpClient(MSAL_HTTP_READ_TIMEOUT_MS)
+                    .build();
+        } catch (FileNotFoundException e) {
+            // re-throw if file not there no point to try another format
+            throw e;
+        } catch (CertificateException | NoSuchAlgorithmException | IOException e) {
+            // ignore not PKCS12 cert error, will try another format after this
+            if (logger.isLoggable(Level.FINER)) {
+                logger.finer(LOGCONTEXT + "Error loading PKCS12 certificate: " + e.getMessage());
+            }
+        }
+
+        if (clientApplication == null) {
+            // try loading X509 cert
+            X509Certificate cert = (X509Certificate) SQLServerCertificateUtils.loadCertificate(certFile);
+
+            if (logger.isLoggable(Level.FINER)) {
+                logger.finer(LOGCONTEXT + "certificate type: " + cert.getType());
+
+                // we don't really need to do this, MSAL will fail if cert is not valid, but good to check here and throw with proper error message
+                cert.checkValidity();
+                logger.finer(LOGCONTEXT + "certificate: " + cert.toString());
+            }
+
+            PrivateKey privateKey = SQLServerCertificateUtils.loadPrivateKey(certKey, certKeyPassword);
+
+            IClientCredential credential = ClientCredentialFactory.createFromCertificate(privateKey, cert);
+            clientApplication = ConfidentialClientApplication.builder(aadPrincipalID, credential)
+                    .executorService(SHARED_MSAL_EXECUTOR).setTokenCacheAccessAspect(aspect)
+                    .authority(authority)
+                    .connectTimeoutForDefaultHttpClient(MSAL_HTTP_CONNECT_TIMEOUT_MS)
+                    .readTimeoutForDefaultHttpClient(MSAL_HTTP_READ_TIMEOUT_MS)
+                    .build();
+        }
+
+        return clientApplication;
     }
 
     static SqlAuthenticationToken getSqlFedAuthTokenIntegrated(SqlFedAuthInfo fedAuthInfo,
             String authenticationString, int millisecondsRemaining) throws SQLServerException {
-        ExecutorService executorService = Executors.newSingleThreadExecutor();
 
         /*
          * principal name does not matter, what matters is the realm name it gets the username in
          * principal_name@realm_name format
          */
         KerberosPrincipal kerberosPrincipal = new KerberosPrincipal("username");
-        String user = kerberosPrincipal.getName();
+        final String user = kerberosPrincipal.getName();
 
         if (logger.isLoggable(Level.FINER)) {
             logger.finer(LOGCONTEXT + authenticationString + ": get FedAuth token integrated, user: " + user
                     + "realm name:" + kerberosPrincipal.getRealm());
         }
 
-        boolean isSemAcquired = false;
+        // Layer A: per-authority PublicClientApplication cache (no per-credential secret material).
+        final String cacheKey = "int:" + fedAuthInfo.stsurl;
+        final PublicClientApplication pca;
         try {
-            //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
-            //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
-            //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
-            //then we want the others to also go and try after waiting for a while.
-            //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
-            //to get their tokens at the same time, stressing the auth endpoint.
-            //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            pca = PCA_CACHE.computeIfAbsent(cacheKey, k -> {
+                try {
+                    return PublicClientApplication
+                            .builder(ActiveDirectoryAuthentication.JDBC_FEDAUTH_CLIENT_ID)
+                            .executorService(SHARED_MSAL_EXECUTOR)
+                            .setTokenCacheAccessAspect(PersistentTokenCacheAccessAspect.getInstance())
+                            .authority(fedAuthInfo.stsurl)
+                            .connectTimeoutForDefaultHttpClient(MSAL_HTTP_CONNECT_TIMEOUT_MS)
+                            .readTimeoutForDefaultHttpClient(MSAL_HTTP_READ_TIMEOUT_MS)
+                            .build();
+                } catch (MalformedURLException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } catch (RuntimeException re) {
+            Throwable c = re.getCause();
+            if (c instanceof MalformedURLException) {
+                throw getCorrectedException((Exception) c, user, authenticationString);
+            }
+            throw re;
+        }
 
-            final PublicClientApplication pca = PublicClientApplication
-                    .builder(ActiveDirectoryAuthentication.JDBC_FEDAUTH_CLIENT_ID).executorService(executorService)
-                    .setTokenCacheAccessAspect(PersistentTokenCacheAccessAspect.getInstance())
-                    .authority(fedAuthInfo.stsurl).build();
+        // Layer B: single-flight on (stsurl + integrated). Followers wait on leader's future.
+        CompletableFuture<SqlAuthenticationToken> mine = new CompletableFuture<>();
+        CompletableFuture<SqlAuthenticationToken> winner = IN_FLIGHT.putIfAbsent(cacheKey, mine);
+        if (winner != null) {
+            try {
+                return winner.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new SQLServerException(e.getMessage(), e);
+            } catch (ExecutionException e) {
+                throw getCorrectedException(e, user, authenticationString);
+            } catch (TimeoutException e) {
+                throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), user, authenticationString);
+            }
+        }
 
+        try {
             final CompletableFuture<IAuthenticationResult> future = pca
                     .acquireToken(IntegratedWindowsAuthenticationParameters
                             .builder(Collections.singleton(fedAuthInfo.spn + SLASH_DEFAULT), user).build());
 
-            final IAuthenticationResult authenticationResult = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
+            final IAuthenticationResult ar = future.get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
 
             if (logger.isLoggable(Level.FINER)) {
-                logger.finer(
-                        LOGCONTEXT + (authenticationResult.account() != null ? authenticationResult.account().username()
-                                + ": " : "" + ACCESS_TOKEN_EXPIRE + authenticationResult.expiresOnDate()));
+                logger.finer(LOGCONTEXT + (ar.account() != null ? ar.account().username() + ": "
+                        : "" + ACCESS_TOKEN_EXPIRE + ar.expiresOnDate()));
             }
 
-            return new SqlAuthenticationToken(authenticationResult.accessToken(), authenticationResult.expiresOnDate());
+            SqlAuthenticationToken tok = new SqlAuthenticationToken(ar.accessToken(), ar.expiresOnDate());
+            mine.complete(tok);
+            return tok;
         } catch (InterruptedException e) {
-            // re-interrupt thread
             Thread.currentThread().interrupt();
-
+            mine.completeExceptionally(e);
             throw new SQLServerException(e.getMessage(), e);
-        } catch (IOException | ExecutionException e) {
+        } catch (ExecutionException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(e, user, authenticationString);
         } catch (TimeoutException e) {
+            mine.completeExceptionally(e);
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), user, authenticationString);
+        } catch (RuntimeException e) {
+            mine.completeExceptionally(e);
+            throw e;
         } finally {
-            if (isSemAcquired) {
-                sem.release();
-            }
-            executorService.shutdown();
+            IN_FLIGHT.remove(cacheKey, mine);
         }
     }
 
@@ -437,22 +583,17 @@ class SQLServerMSAL4JUtils {
             logger.finer(LOGCONTEXT + authenticationString + ": get FedAuth token interactive for user: " + user);
         }
 
-        boolean isSemAcquired = false;
         try {
-            //
-            //Just try to acquire the semaphore and if can't then proceed to attempt to get the token.
-            //The purpose is to optimize the token acquisition process, the first caller succeeding does caching 
-            //which is then leveraged by subsequent threads. However, if the first thread takes considerable time, 
-            //then we want the others to also go and try after waiting for a while.
-            //If we were to let say 30 threads try in parallel, they would all miss the cache and hit the AAD auth endpoints 
-            //to get their tokens at the same time, stressing the auth endpoint.
-            //
-            isSemAcquired = sem.tryAcquire(Math.min(millisecondsRemaining, TOKEN_SEM_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
-
+            // Interactive flows hold a system-browser handle per attempt and cannot share an open
+            // AuthorizationCodeRequest across callers, so we intentionally do NOT cache the PCA
+            // and do NOT single-flight here. We still bound MSAL's HTTP socket waits.
             PublicClientApplication pca = PublicClientApplication
                     .builder(ActiveDirectoryAuthentication.JDBC_FEDAUTH_CLIENT_ID).executorService(executorService)
                     .setTokenCacheAccessAspect(PersistentTokenCacheAccessAspect.getInstance())
-                    .authority(fedAuthInfo.stsurl).build();
+                    .authority(fedAuthInfo.stsurl)
+                    .connectTimeoutForDefaultHttpClient(MSAL_HTTP_CONNECT_TIMEOUT_MS)
+                    .readTimeoutForDefaultHttpClient(MSAL_HTTP_READ_TIMEOUT_MS)
+                    .build();
 
             CompletableFuture<IAuthenticationResult> future = null;
             IAuthenticationResult authenticationResult = null;
@@ -526,9 +667,6 @@ class SQLServerMSAL4JUtils {
         } catch (TimeoutException e) {
             throw getCorrectedException(new SQLServerException(SQLServerException.getErrString("R_connectionTimedOut"), e), user, authenticationString);
         } finally {
-            if (isSemAcquired) {
-                sem.release();
-            }
             executorService.shutdown();
         }
     }
