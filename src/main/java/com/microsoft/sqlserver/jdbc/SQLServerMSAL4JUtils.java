@@ -197,10 +197,16 @@ class SQLServerMSAL4JUtils {
             //
             // Fast path: try to satisfy the request from the MSAL in-memory token cache (rehydrated
             // from the persistent cache aspect) WITHOUT taking the semaphore. A cache hit needs no
-            // AAD round-trip, so it must not queue behind threads that are refreshing the token.
+            // AAD round-trip, so it must not queue behind threads that are refreshing/fetching the token from Entra ID.
             // Serializing cache hits behind the gate is the bottleneck this avoids.
             //
             try {
+                // acquireTokenSilently: MSAL's cache-only token lookup. It checks the client
+                // application's in-memory token cache (rehydrated here from the persistent cache
+                // aspect) for a still-valid access token matching these scopes and returns it
+                // WITHOUT contacting Entra ID. If none is cached (or it is expired and cannot be
+                // refreshed silently), the returned future fails with an ExecutionException, which
+                // we treat as a cache miss and handle by falling through to the gated slow path.
                 final IAuthenticationResult silentResult = clientApplication
                         .acquireTokenSilently(SilentParameters.builder(scopes).build())
                         .get(Math.min(millisecondsRemaining, TOKEN_WAIT_DURATION_MS), TimeUnit.MILLISECONDS);
